@@ -3,13 +3,17 @@
 Take Three is an early, local-first browser screen recorder that can upload
 recordings to SharePoint or Google Drive.
 
-**Prototype:** Video editing, transcription, and MP4 export are not implemented.
+**Prototype:** Advanced editing and MP4 export are not implemented.
 Cloud uploads require your own OAuth app registrations and provider access.
 
 ## What works today
 
 - Record a screen or window with an optional microphone and a three-second countdown.
 - Review a take and save it to a local browser library.
+- Trim the beginning and end into a new WebM copy while keeping the original.
+- Cover or blur screen areas in a new local copy before sharing.
+- Generate searchable, timestamped transcripts on-device and jump to matching moments.
+- Export the entire library as a ZIP backup with recordings and metadata.
 - Download recordings as WebM, delete them, or upload a custom thumbnail.
 - Use floating recording controls in browsers that support Document Picture-in-Picture.
 - Upload saved WebM recordings to Google Drive or a SharePoint document library.
@@ -20,6 +24,24 @@ running out of storage can remove or prevent saving recordings. Download
 anything you want to keep. Screen and audio capture support varies by browser,
 operating system, and the source selected. A floating control window may
 appear when capturing the entire display.
+
+Use **Backup library** to download one ZIP containing each saved WebM plus a
+`manifest.json` with titles, dates, thumbnails, transcripts, and upload links.
+The backup is created in the browser and is not uploaded anywhere.
+
+Transcription runs in your browser using a small Whisper model. The first
+transcription downloads the model from Hugging Face; later use can reuse the
+browser's cached copy. Recording audio is not sent to a transcription service.
+Processing speed depends on your device, and a recording needs an audio track
+for transcription.
+
+Trimming also runs in the browser. It re-encodes the selected section in
+real time, so the original remains unchanged and output quality may differ
+slightly. Frame timing can shift slightly at the cut points.
+
+Redaction masks are fixed to the same screen areas throughout the clip; they
+do not track moving content. Solid covers are baked into the exported video.
+Blur is cosmetic and may not fully hide text or other sensitive details.
 
 ## Run locally
 
@@ -84,8 +106,7 @@ separate files.
 
 ## Roadmap
 
-Editing, transcription, and more reliable audio and browser support are future
-work.
+Advanced editing and more reliable audio and browser support are future work.
 
 For a Rust experiment, keep the React interface and first build a small Rust
 service using Axum for provider integrations. A later FFmpeg worker could handle

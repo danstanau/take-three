@@ -1,14 +1,19 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Cloud,
+  AudioLines,
   Download,
+  EyeOff,
   ExternalLink,
+  LoaderCircle,
   Mic,
   Monitor,
   MoreHorizontal,
   PictureInPicture2,
   Play,
+  Scissors,
   Settings,
+  Search,
   Square,
   Trash2,
   Upload,
@@ -23,6 +28,14 @@ import {
   type Provider,
   type UploadResult,
 } from "./cloud";
+import {
+  getModelProgress,
+  searchTranscript,
+  transcribeRecording,
+  type TranscriptSegment,
+} from "./transcription";
+import { createLibraryBackup } from "./backup";
+import { renderTrimmedWebM, type RedactionMask } from "./trim";
 
 type Recording = {
   id: string;
@@ -32,6 +45,7 @@ type Recording = {
   blob: Blob;
   thumbnail?: string;
   uploads?: UploadResult[];
+  transcript?: TranscriptSegment[];
 };
 
 const DB_NAME = "take-three";
@@ -83,6 +97,11 @@ function formatTime(seconds: number) {
   return `${String(Math.floor(safe / 60)).padStart(2, "0")}:${String(safe % 60).padStart(2, "0")}`;
 }
 
+function formatTrimTime(seconds: number) {
+  const safe = Math.max(0, seconds);
+  return `${formatTime(safe)}.${Math.floor((safe % 1) * 10)}`;
+}
+
 function App() {
   const [recordings, setRecordings] = useState<Recording[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
@@ -100,6 +119,27 @@ function App() {
   const [siteUrl, setSiteUrl] = useState("");
   const [uploading, setUploading] = useState<{ provider: Provider; recordingId: string; percent: number }>();
   const [cloudError, setCloudError] = useState<string>();
+  const [transcribingId, setTranscribingId] = useState<string>();
+  const [transcriptionStatus, setTranscriptionStatus] = useState("");
+  const [transcriptionError, setTranscriptionError] = useState<string>();
+  const [transcriptQuery, setTranscriptQuery] = useState("");
+  const [backupProgress, setBackupProgress] = useState<number>();
+  const [backupError, setBackupError] = useState<string>();
+  const [trimOpen, setTrimOpen] = useState(false);
+  const [trimStart, setTrimStart] = useState(0);
+  const [trimEnd, setTrimEnd] = useState(0);
+  const [trimDuration, setTrimDuration] = useState(0);
+  const [trimProgress, setTrimProgress] = useState<number>();
+  const [trimError, setTrimError] = useState<string>();
+  const [redactionOpen, setRedactionOpen] = useState(false);
+  const [redactionMode, setRedactionMode] = useState<RedactionMask["mode"]>("cover");
+  const [redactionMasks, setRedactionMasks] = useState<RedactionMask[]>([]);
+  const [selectingRedaction, setSelectingRedaction] = useState(false);
+  const [draftRedaction, setDraftRedaction] = useState<Omit<RedactionMask, "id">>();
+  const [redactionError, setRedactionError] = useState<string>();
+  const [previewAspectRatio, setPreviewAspectRatio] = useState("16 / 9");
+  const redactionLayerRef = useRef<HTMLDivElement>(null);
+  const redactionStartRef = useRef<{ x: number; y: number; mode: RedactionMask["mode"] } | undefined>(undefined);
 
   const streamRef = useRef<MediaStream>(undefined);
   const recorderRef = useRef<MediaRecorder>(undefined);
@@ -108,6 +148,7 @@ function App() {
   const countdownTimerRef = useRef<number>(undefined);
   const pipRef = useRef<Window>(undefined);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [selectedVideoUrl, setSelectedVideoUrl] = useState<string>();
 
   useEffect(() => {
     getRecordings().then((items) => {
@@ -127,6 +168,207 @@ function App() {
   }, [toast]);
 
   const selected = recordings.find((item) => item.id === selectedId);
+
+  useEffect(() => {
+    if (!selected) {
+      setSelectedVideoUrl(undefined);
+      return;
+    }
+    const url = URL.createObjectURL(selected.blob);
+    setSelectedVideoUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [selected?.id, selected?.blob]);
+
+  useEffect(() => {
+    setTranscriptQuery("");
+    setTranscriptionError(undefined);
+  }, [selectedId]);
+
+  useEffect(() => {
+    setTrimOpen(false);
+    setTrimStart(0);
+    setTrimEnd(selected?.duration ?? 0);
+    setTrimDuration(selected?.duration ?? 0);
+    setTrimError(undefined);
+  }, [selectedId]);
+
+  useEffect(() => {
+    setRedactionOpen(false);
+    setRedactionMode("cover");
+    setRedactionMasks([]);
+    setSelectingRedaction(false);
+    setDraftRedaction(undefined);
+    setRedactionError(undefined);
+    setPreviewAspectRatio("16 / 9");
+    redactionStartRef.current = undefined;
+  }, [selectedId]);
+
+  async function transcribeTake(recording: Recording) {
+    setTranscribingId(recording.id);
+    setTranscriptionError(undefined);
+    setTranscriptionStatus("Preparing recording audio…");
+    try {
+      const transcript = await transcribeRecording(
+        recording.blob,
+        (progress) => setTranscriptionStatus(getModelProgress(progress) ?? "Loading speech model…"),
+        () => setTranscriptionStatus("Transcribing on this device…"),
+      );
+      const updated = { ...recording, transcript };
+      await saveRecording(updated);
+      setRecordings((items) => items.map((item) => item.id === updated.id ? updated : item));
+      setToast(transcript.length ? "Transcript saved" : "No speech detected");
+    } catch (error) {
+      setTranscriptionError(error instanceof Error ? error.message : "Could not transcribe this recording.");
+    } finally {
+      setTranscribingId(undefined);
+      setTranscriptionStatus("");
+    }
+  }
+
+  function seekToSegment(segment: TranscriptSegment) {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = segment.start;
+  }
+
+  function getRedactionPoint(clientX: number, clientY: number) {
+    const video = videoRef.current;
+    const layer = redactionLayerRef.current;
+    if (!video || !layer || !video.videoWidth || !video.videoHeight) return undefined;
+    const bounds = layer.getBoundingClientRect();
+    const scale = Math.min(bounds.width / video.videoWidth, bounds.height / video.videoHeight);
+    const width = video.videoWidth * scale;
+    const height = video.videoHeight * scale;
+    const left = bounds.left + (bounds.width - width) / 2;
+    const top = bounds.top + (bounds.height - height) / 2;
+    const x = (clientX - left) / width;
+    const y = (clientY - top) / height;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return undefined;
+    return { x, y };
+  }
+
+  function beginRedaction(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!selectingRedaction) return;
+    const point = getRedactionPoint(event.clientX, event.clientY);
+    if (!point) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    redactionStartRef.current = { ...point, mode: redactionMode };
+    setDraftRedaction({ ...point, width: 0, height: 0, mode: redactionMode });
+  }
+
+  function updateRedaction(event: ReactPointerEvent<HTMLDivElement>) {
+    const start = redactionStartRef.current;
+    const point = getRedactionPoint(event.clientX, event.clientY);
+    if (!start || !point) return;
+    setDraftRedaction({
+      x: Math.min(start.x, point.x),
+      y: Math.min(start.y, point.y),
+      width: Math.abs(point.x - start.x),
+      height: Math.abs(point.y - start.y),
+      mode: start.mode,
+    });
+  }
+
+  function finishRedaction(event: ReactPointerEvent<HTMLDivElement>) {
+    const start = redactionStartRef.current;
+    const point = getRedactionPoint(event.clientX, event.clientY);
+    if (start && point) {
+      const mask = {
+        id: crypto.randomUUID(),
+        x: Math.min(start.x, point.x),
+        y: Math.min(start.y, point.y),
+        width: Math.abs(point.x - start.x),
+        height: Math.abs(point.y - start.y),
+        mode: start.mode,
+      };
+      if (mask.width >= 0.005 && mask.height >= 0.005) {
+        setRedactionMasks((masks) => [...masks, mask]);
+      }
+    }
+    redactionStartRef.current = undefined;
+    setDraftRedaction(undefined);
+    setSelectingRedaction(false);
+  }
+
+  const visibleTranscript = selected?.transcript
+    ? searchTranscript(selected.transcript, transcriptQuery)
+    : undefined;
+
+  async function exportBackup() {
+    if (!recordings.length || backupProgress !== undefined) return;
+    setBackupError(undefined);
+    setBackupProgress(0);
+    try {
+      const backup = await createLibraryBackup(recordings, (written, total) => {
+        setBackupProgress(total ? Math.min(100, Math.round((written / total) * 100)) : 100);
+      });
+      const url = URL.createObjectURL(backup);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `Take-Three-Backup-${new Date().toISOString().slice(0, 10)}.zip`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setToast(`Backed up ${recordings.length} ${recordings.length === 1 ? "take" : "takes"}`);
+    } catch (error) {
+      setBackupError(error instanceof Error ? error.message : "Could not export the library backup.");
+    } finally {
+      setBackupProgress(undefined);
+    }
+  }
+
+  async function saveEditedTake() {
+    if (!selected || !videoRef.current || trimProgress !== undefined) return;
+    const video = videoRef.current;
+    const start = Math.max(0, trimStart);
+    const end = Math.min(trimEnd, video.duration);
+    const hasTrim = start > 0 || end < video.duration - 0.1;
+    const hasRedactions = redactionMasks.length > 0;
+    if (!hasTrim && !hasRedactions) return;
+    if (!Number.isFinite(end) || end - start < 0.1) {
+      setTrimError("Choose a clip that is at least 0.1 seconds long.");
+      return;
+    }
+
+    setTrimError(undefined);
+    setRedactionError(undefined);
+    setTrimProgress(0);
+    try {
+      const blob = await renderTrimmedWebM(video, start, end, setTrimProgress, redactionMasks);
+      const duration = await new Promise<number>((resolve, reject) => {
+        const url = URL.createObjectURL(blob);
+        const preview = document.createElement("video");
+        preview.preload = "metadata";
+        preview.onloadedmetadata = () => {
+          URL.revokeObjectURL(url);
+          resolve(Number.isFinite(preview.duration) ? preview.duration : end - start);
+        };
+        preview.onerror = () => {
+          URL.revokeObjectURL(url);
+          reject(new Error("Could not read the trimmed recording."));
+        };
+        preview.src = url;
+      });
+      const trimmed: Recording = {
+        id: crypto.randomUUID(),
+        title: `${selected.title} ${hasTrim && hasRedactions ? "(edited)" : hasTrim ? "(trimmed)" : "(redacted)"}`,
+        createdAt: Date.now(),
+        duration,
+        blob,
+        thumbnail: await captureThumbnail(blob),
+      };
+      await saveRecording(trimmed);
+      setRecordings((items) => [trimmed, ...items]);
+      setSelectedId(trimmed.id);
+      setToast("Trimmed copy saved");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not create this edited copy.";
+      setTrimError(message);
+      setRedactionError(message);
+    } finally {
+      setTrimProgress(undefined);
+    }
+  }
 
   function beep() {
     const context = new AudioContext();
@@ -374,8 +616,21 @@ function App() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand"><span className="brand-mark"><Play fill="currentColor" /></span><span>Take Three</span></div>
+        <div className="brand">
+          <span className="brand-mark">03</span>
+          <span>Take Three</span>
+          <span className="brand-note">PERSONAL SCREEN STUDIO</span>
+        </div>
         <div className="top-actions">
+          <button
+            className="secondary-button backup-button"
+            onClick={exportBackup}
+            disabled={!recordings.length || backupProgress !== undefined}
+            aria-label="Export library backup"
+          >
+            <Download />
+            <span>{backupProgress === undefined ? "Backup library" : `Exporting ${backupProgress}%`}</span>
+          </button>
           <button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Settings"><Settings /></button>
         </div>
       </header>
@@ -450,6 +705,7 @@ function App() {
                   key={recording.id}
                   className={`library-card ${selectedId === recording.id ? "selected" : ""}`}
                   onClick={() => setSelectedId(recording.id)}
+                  disabled={trimProgress !== undefined}
                 >
                   <div className="thumbnail">
                     {recording.thumbnail ? <img src={recording.thumbnail} alt="" /> : <div><Play /></div>}
@@ -471,18 +727,93 @@ function App() {
           <div className="detail-heading">
             <div><span className="section-name">Selected take</span><h2>{selected.title}</h2></div>
             <div className="detail-actions">
+              <button
+                className="icon-button"
+                onClick={() => {
+                  if (redactionOpen) {
+                    redactionStartRef.current = undefined;
+                    setSelectingRedaction(false);
+                    setDraftRedaction(undefined);
+                  }
+                  setRedactionOpen((open) => !open);
+                  setRedactionError(undefined);
+                }}
+                disabled={trimProgress !== undefined}
+                aria-label="Cover or blur sensitive areas"
+                title="Cover or blur"
+              ><EyeOff /></button>
+              <button
+                className="icon-button"
+                onClick={() => { setTrimOpen((open) => !open); setTrimError(undefined); }}
+                disabled={trimProgress !== undefined}
+                aria-label="Trim beginning and end"
+                title="Trim a copy"
+              ><Scissors /></button>
               <button className="icon-button" onClick={() => downloadRecording(selected)} aria-label="Download"><Download /></button>
-              <button className="icon-button danger" onClick={() => removeRecording(selected)} disabled={!!uploading} aria-label="Delete"><Trash2 /></button>
+              <button className="icon-button danger" onClick={() => removeRecording(selected)} disabled={!!uploading || transcribingId === selected.id || trimProgress !== undefined} aria-label="Delete"><Trash2 /></button>
             </div>
           </div>
           <div className="detail-grid">
-            <div className="detail-preview">
-              {selected.thumbnail && <img src={selected.thumbnail} alt="" />}
-              <button onClick={() => {
-                const url = URL.createObjectURL(selected.blob);
-                const video = window.open(url, "_blank");
-                if (video) video.addEventListener("beforeunload", () => URL.revokeObjectURL(url));
-              }}><Play fill="currentColor" /></button>
+            <div className="detail-preview" style={{ aspectRatio: previewAspectRatio }}>
+              <video
+                ref={videoRef}
+                src={selectedVideoUrl}
+                poster={selected.thumbnail}
+                controls={trimProgress === undefined && !selectingRedaction}
+                preload="metadata"
+                aria-label={`Preview ${selected.title}`}
+                onLoadedMetadata={(event) => {
+                  const duration = event.currentTarget.duration;
+                  if (!Number.isFinite(duration)) return;
+                  if (event.currentTarget.videoWidth && event.currentTarget.videoHeight) {
+                    setPreviewAspectRatio(`${event.currentTarget.videoWidth} / ${event.currentTarget.videoHeight}`);
+                  }
+                  setTrimDuration(duration);
+                  setTrimEnd((current) => current === selected.duration
+                    ? duration
+                    : Math.min(current || duration, duration));
+                  setTrimStart((current) => Math.min(current, Math.max(0, duration - 0.1)));
+                }}
+              />
+              {redactionOpen && (
+                <div
+                  ref={redactionLayerRef}
+                  className={`redaction-layer ${selectingRedaction ? "selecting" : ""}`}
+                  onPointerDown={beginRedaction}
+                  onPointerMove={updateRedaction}
+                  onPointerUp={finishRedaction}
+                  onPointerCancel={() => {
+                    redactionStartRef.current = undefined;
+                    setDraftRedaction(undefined);
+                    setSelectingRedaction(false);
+                  }}
+                  aria-label="Redaction mask drawing area"
+                >
+                  {redactionMasks.map((mask) => (
+                    <span
+                      key={mask.id}
+                      className={`redaction-mask ${mask.mode}`}
+                      style={{
+                        left: `${mask.x * 100}%`,
+                        top: `${mask.y * 100}%`,
+                        width: `${mask.width * 100}%`,
+                        height: `${mask.height * 100}%`,
+                      }}
+                    />
+                  ))}
+                  {draftRedaction && (
+                    <span
+                      className={`redaction-mask draft ${draftRedaction.mode}`}
+                      style={{
+                        left: `${draftRedaction.x * 100}%`,
+                        top: `${draftRedaction.y * 100}%`,
+                        width: `${draftRedaction.width * 100}%`,
+                        height: `${draftRedaction.height * 100}%`,
+                      }}
+                    />
+                  )}
+                </div>
+              )}
             </div>
             <div className="detail-fields">
               <label>Thumbnail
@@ -508,9 +839,218 @@ function App() {
               </div>
             </div>
           </div>
+          {trimOpen && (
+            <section className="trim-panel" aria-label="Trim recording">
+              <div className="transcript-heading">
+                <div>
+                  <span className="section-name">Keep the original safe</span>
+                  <h3><Scissors /> Trim a copy</h3>
+                </div>
+                <button className="secondary-button" onClick={() => setTrimOpen(false)} disabled={trimProgress !== undefined}>Cancel</button>
+              </div>
+              <p className="trim-note">
+                Choose the section to keep. This browser re-encodes it in real time; the start and end can shift slightly to a nearby frame.
+              </p>
+              <div className="trim-fields">
+                <label>Start
+                  <div className="trim-time-input">
+                    <input
+                      type="number"
+                      min="0"
+                      max={Math.max(0, trimEnd - 0.1)}
+                      step="0.1"
+                      value={trimStart}
+                      disabled={trimProgress !== undefined}
+                      onChange={(event) => setTrimStart(Math.max(0, Math.min(Number(event.target.value), trimEnd - 0.1)))}
+                    />
+                    <button className="secondary-button" onClick={() => setTrimStart(Math.max(0, Math.min(videoRef.current?.currentTime ?? 0, trimEnd - 0.1)))} disabled={trimProgress !== undefined}>Use playhead</button>
+                  </div>
+                  <input
+                    className="trim-range"
+                    type="range"
+                    min="0"
+                    max={Math.max(0.1, trimDuration - 0.1)}
+                    step="0.1"
+                    value={Math.min(trimStart, Math.max(0, trimDuration - 0.1))}
+                    aria-label="Clip start time"
+                    disabled={trimProgress !== undefined}
+                    onChange={(event) => setTrimStart(Math.min(Number(event.target.value), trimEnd - 0.1))}
+                  />
+                </label>
+                <label>End
+                  <div className="trim-time-input">
+                    <input
+                      type="number"
+                      min={trimStart + 0.1}
+                      max={trimDuration}
+                      step="0.1"
+                      value={trimEnd}
+                      disabled={trimProgress !== undefined}
+                      onChange={(event) => setTrimEnd(Math.max(trimStart + 0.1, Math.min(Number(event.target.value), trimDuration)))}
+                    />
+                    <button className="secondary-button" onClick={() => setTrimEnd(Math.max(trimStart + 0.1, Math.min(videoRef.current?.currentTime ?? trimDuration, trimDuration)))} disabled={trimProgress !== undefined}>Use playhead</button>
+                  </div>
+                  <input
+                    className="trim-range"
+                    type="range"
+                    min={Math.min(trimDuration, trimStart + 0.1)}
+                    max={Math.max(trimDuration, 0.1)}
+                    step="0.1"
+                    value={Math.max(trimStart + 0.1, Math.min(trimEnd, trimDuration))}
+                    aria-label="Clip end time"
+                    disabled={trimProgress !== undefined}
+                    onChange={(event) => setTrimEnd(Math.max(trimStart + 0.1, Number(event.target.value)))}
+                  />
+                </label>
+              </div>
+              <div className="trim-summary">
+                <span>Keep {formatTrimTime(trimStart)} – {formatTrimTime(trimEnd)}</span>
+                <span>{formatTrimTime(Math.max(0, trimEnd - trimStart))} clip</span>
+              </div>
+              {trimProgress !== undefined && (
+                <p className="transcription-status" role="status">Creating trimmed copy · {Math.round(trimProgress * 100)}%</p>
+              )}
+              {trimError && <p className="cloud-error" role="alert">{trimError}</p>}
+              <div className="trim-footer">
+                <span>The original stays unchanged. The new copy will need a fresh transcript and upload.</span>
+                <button
+                  className="primary-button"
+                  onClick={saveEditedTake}
+                  disabled={trimProgress !== undefined || trimStart <= 0 && trimEnd >= trimDuration && !redactionMasks.length || trimEnd - trimStart < 0.1}
+                >
+                  {trimProgress === undefined ? redactionMasks.length ? "Create edited copy" : "Create trimmed copy" : "Rendering…"}
+                </button>
+              </div>
+            </section>
+          )}
+          {redactionOpen && (
+            <section className="redaction-panel" aria-label="Cover or blur sensitive areas">
+              <div className="transcript-heading">
+                <div>
+                  <span className="section-name">Redact before sharing</span>
+                  <h3><EyeOff /> Sensitive areas</h3>
+                </div>
+                <div className="redaction-modes" role="group" aria-label="Redaction style">
+                  <button
+                    className={redactionMode === "cover" ? "selected" : ""}
+                    onClick={() => setRedactionMode("cover")}
+                    aria-pressed={redactionMode === "cover"}
+                    disabled={selectingRedaction || trimProgress !== undefined}
+                  >Solid cover</button>
+                  <button
+                    className={redactionMode === "blur" ? "selected" : ""}
+                    onClick={() => setRedactionMode("blur")}
+                    aria-pressed={redactionMode === "blur"}
+                    disabled={selectingRedaction || trimProgress !== undefined}
+                  >Blur</button>
+                </div>
+              </div>
+              <p className="redaction-note">
+                {redactionMode === "cover"
+                  ? "Solid cover is recommended for passwords and private details."
+                  : "Blur is less reliable for secrets; text may still be recoverable. Masks stay fixed as the video plays."}
+              </p>
+              <div className="redaction-actions">
+                <button
+                  className={selectingRedaction ? "stop-button" : "secondary-button"}
+                  onClick={() => {
+                    if (selectingRedaction) {
+                      redactionStartRef.current = undefined;
+                      setDraftRedaction(undefined);
+                    }
+                    setSelectingRedaction((value) => !value);
+                  }}
+                  disabled={trimProgress !== undefined}
+                >
+                  {selectingRedaction ? "Cancel drawing" : "Draw area"}
+                </button>
+                <span>{selectingRedaction ? "Drag over the preview to mark an area." : `${redactionMasks.length} ${redactionMasks.length === 1 ? "area" : "areas"} marked`}</span>
+              </div>
+              {!!redactionMasks.length && (
+                <ul className="redaction-list">
+                  {redactionMasks.map((mask, index) => (
+                    <li key={mask.id}>
+                      <span>Area {index + 1} · {mask.mode === "cover" ? "Solid cover" : "Blur"}</span>
+                      <button
+                        className="secondary-button"
+                        onClick={() => setRedactionMasks((items) => items.filter((item) => item.id !== mask.id))}
+                        disabled={trimProgress !== undefined}
+                      >Remove</button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {redactionError && <p className="cloud-error" role="alert">{redactionError}</p>}
+              <div className="trim-footer">
+                <span>Creates a new local copy with masks baked in. Any current trim range also applies.</span>
+                <button
+                  className="primary-button"
+                  onClick={saveEditedTake}
+                  disabled={!redactionMasks.length || trimProgress !== undefined || trimEnd - trimStart < 0.1}
+                >
+                  {trimProgress === undefined ? "Create redacted copy" : "Rendering…"}
+                </button>
+              </div>
+            </section>
+          )}
+          <section className="transcript-panel" aria-label="Recording transcript">
+            <div className="transcript-heading">
+              <div>
+                <span className="section-name">On-device transcription</span>
+                <h3><AudioLines /> Transcript</h3>
+              </div>
+              <button
+                className="secondary-button transcript-action"
+                onClick={() => transcribeTake(selected)}
+                disabled={!!transcribingId}
+              >
+                {transcribingId === selected.id
+                  ? <><LoaderCircle className="spinner" /> Working…</>
+                  : selected.transcript ? "Regenerate" : "Create transcript"}
+              </button>
+            </div>
+            <p className="transcript-note">
+              Speech is processed in this browser. The first run downloads a model; your recording is not uploaded for transcription.
+            </p>
+            {transcribingId === selected.id && (
+              <p className="transcription-status" role="status">{transcriptionStatus}</p>
+            )}
+            {transcriptionError && <p className="cloud-error" role="alert">{transcriptionError}</p>}
+            {selected.transcript && (
+              <>
+                <label className="transcript-search">
+                  <Search />
+                  <input
+                    type="search"
+                    value={transcriptQuery}
+                    onChange={(event) => setTranscriptQuery(event.target.value)}
+                    placeholder="Search transcript"
+                    aria-label="Search transcript"
+                  />
+                </label>
+                {visibleTranscript?.length ? (
+                  <ol className="transcript-list">
+                    {visibleTranscript.map((segment, index) => (
+                      <li key={`${segment.start}-${index}`}>
+                        <button className="transcript-segment" onClick={() => seekToSegment(segment)}>
+                          <time>{formatTime(segment.start)}</time>
+                          <span>{segment.text}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="transcript-empty">
+                    {selected.transcript.length ? "No matching transcript segments." : "No speech was detected in this recording."}
+                  </p>
+                )}
+              </>
+            )}
+          </section>
         </section>
       )}
 
+      {backupError && <div className="cloud-alert" role="alert">{backupError}<button onClick={() => setBackupError(undefined)} aria-label="Dismiss backup error"><X /></button></div>}
       {cloudError && !settingsOpen && <div className="cloud-alert" role="alert">{cloudError}<button onClick={() => setCloudError(undefined)} aria-label="Dismiss error"><X /></button></div>}
 
       {settingsOpen && (
