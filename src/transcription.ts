@@ -12,7 +12,7 @@ export type TranscriptSegment = {
 
 type Transcriber = (
   audio: Float32Array,
-  options: { chunk_length_s: number; stride_length_s: number; return_timestamps: true; task: string },
+  options: { chunk_length_s: number; stride_length_s: number; return_timestamps: true; task: string; max_new_tokens: number },
 ) => Promise<AutomaticSpeechRecognitionOutput>;
 
 let transcriberPromise: Promise<Transcriber> | undefined;
@@ -21,7 +21,7 @@ function getTranscriber(onProgress?: ProgressCallback): Promise<Transcriber> {
   if (!transcriberPromise) {
     transcriberPromise = import("@huggingface/transformers")
       .then(({ pipeline }) =>
-        pipeline("automatic-speech-recognition", "onnx-community/whisper-tiny", {
+        pipeline("automatic-speech-recognition", "onnx-community/whisper-small", {
           dtype: "q8",
           progress_callback: onProgress,
         }),
@@ -34,13 +34,23 @@ function getTranscriber(onProgress?: ProgressCallback): Promise<Transcriber> {
   return transcriberPromise;
 }
 
-export function toTranscriptSegments(output: AutomaticSpeechRecognitionOutput): TranscriptSegment[] {
-  return (output.chunks ?? []).flatMap((chunk) => {
+export function toTranscriptSegments(
+  output: { text: string; chunks?: Array<{ text: string; timestamp: [number | null, number | null] }> },
+  duration?: number,
+): TranscriptSegment[] {
+  const chunks = output.chunks ?? [];
+  const audioEnd = duration !== undefined && Number.isFinite(duration) && duration >= 0 ? duration : undefined;
+  return chunks.flatMap((chunk, index) => {
     const text = chunk.text.trim();
     const [start, end] = chunk.timestamp;
-    if (!text || !Number.isFinite(start) || !Number.isFinite(end)) return [];
+    if (!text || typeof start !== "number" || !Number.isFinite(start) || (audioEnd !== undefined && start > audioEnd)) return [];
     const safeStart = Math.max(0, start);
-    return [{ start: safeStart, end: Math.max(safeStart, end), text }];
+    let safeEnd = end;
+    if (typeof safeEnd !== "number" || !Number.isFinite(safeEnd)) {
+      safeEnd = chunks.slice(index + 1).map((next) => next.timestamp[0])
+        .find((time) => typeof time === "number" && Number.isFinite(time) && time >= safeStart) ?? audioEnd ?? safeStart;
+    }
+    return [{ start: safeStart, end: Math.max(safeStart, audioEnd === undefined ? safeEnd : Math.min(safeEnd, audioEnd)), text }];
   });
 }
 
@@ -80,6 +90,7 @@ export async function transcribeRecording(
 ): Promise<TranscriptSegment[]> {
   const audio = await decodeToMono16k(blob);
   if (!audio.length) throw new Error("This recording does not contain audio to transcribe.");
+  if (audio.every((sample) => sample === 0)) return [];
 
   const transcriber = await getTranscriber(onProgress);
   onModelReady?.();
@@ -88,8 +99,10 @@ export async function transcribeRecording(
     stride_length_s: 5,
     return_timestamps: true,
     task: "transcribe",
+    // Keep generation within each overlapping window rather than re-seeking through it.
+    max_new_tokens: 448,
   });
-  return toTranscriptSegments(output);
+  return toTranscriptSegments(output, audio.length / 16_000);
 }
 
 export function getModelProgress(progress: ProgressInfo): string | undefined {

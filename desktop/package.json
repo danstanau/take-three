@@ -1,0 +1,7 @@
+{
+  "name": "take-three",
+  "version": "1.0.0",
+  "description": "Take Three desktop app",
+  "private": true,
+  "main": "main.cjs"
+}

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } f
 import {
   Cloud,
   AudioLines,
+  Copy,
   Download,
   EyeOff,
   ExternalLink,
@@ -23,6 +24,7 @@ import {
   CloudHttpError,
   connectGoogle,
   connectMicrosoft,
+  createSharePointLink,
   uploadGoogle,
   uploadSharePoint,
   type Provider,
@@ -49,6 +51,34 @@ type Recording = {
 };
 
 const DB_NAME = "take-three";
+const CLOUD_SETTINGS_KEY = "take-three.cloud-settings";
+
+type CloudSettings = {
+  microsoftClientId: string;
+  microsoftTenantId: string;
+  googleClientId: string;
+  googleClientSecret: string;
+  siteUrl: string;
+};
+
+const emptyCloudSettings: CloudSettings = {
+  microsoftClientId: "",
+  microsoftTenantId: "",
+  googleClientId: "",
+  googleClientSecret: "",
+  siteUrl: "",
+};
+
+function readCloudSettings(): CloudSettings {
+  const raw = localStorage.getItem(CLOUD_SETTINGS_KEY);
+  if (!raw) return emptyCloudSettings;
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object") throw new Error("Saved cloud settings are invalid.");
+  const values = parsed as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.keys(emptyCloudSettings).map((key) => [key, typeof values[key] === "string" ? values[key] : ""]),
+  ) as CloudSettings;
+}
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -116,8 +146,9 @@ function App() {
   const [toast, setToast] = useState<string>();
   const [tokens, setTokens] = useState<Partial<Record<Provider, string>>>({});
   const [connecting, setConnecting] = useState<Provider>();
-  const [siteUrl, setSiteUrl] = useState("");
-  const [uploading, setUploading] = useState<{ provider: Provider; recordingId: string; percent: number }>();
+  const [microsoftDeviceCode, setMicrosoftDeviceCode] = useState<string>();
+  const [cloudSettings, setCloudSettings] = useState<CloudSettings>(emptyCloudSettings);
+  const [uploading, setUploading] = useState<{ provider: Provider; recordingId: string; percent: number; sharing?: boolean }>();
   const [cloudError, setCloudError] = useState<string>();
   const [transcribingId, setTranscribingId] = useState<string>();
   const [transcriptionStatus, setTranscriptionStatus] = useState("");
@@ -149,6 +180,14 @@ function App() {
   const pipRef = useRef<Window>(undefined);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [selectedVideoUrl, setSelectedVideoUrl] = useState<string>();
+
+  useEffect(() => {
+    try {
+      setCloudSettings(readCloudSettings());
+    } catch (error) {
+      setCloudError(error instanceof Error ? `Could not load cloud settings: ${error.message}` : "Could not load cloud settings.");
+    }
+  }, []);
 
   useEffect(() => {
     getRecordings().then((items) => {
@@ -384,22 +423,24 @@ function App() {
   }
 
   async function startRecording() {
+    let display: MediaStream | undefined;
     try {
-      const display = await navigator.mediaDevices.getDisplayMedia({
+      const selectedDisplay = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: { ideal: 30, max: 60 } },
         audio: true,
       });
-      let combined = display;
+      display = selectedDisplay;
+      let combined = selectedDisplay;
       if (micEnabled) {
         const mic = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true },
         });
         combined = new MediaStream([
-          ...display.getVideoTracks(),
-          ...display.getAudioTracks(),
+          ...selectedDisplay.getVideoTracks(),
+          ...selectedDisplay.getAudioTracks(),
           ...mic.getAudioTracks(),
         ]);
-        mic.getTracks().forEach((track) => display.addTrack(track));
+        mic.getTracks().forEach((track) => selectedDisplay.addTrack(track));
       }
       streamRef.current = combined;
 
@@ -418,6 +459,7 @@ function App() {
         });
       }, 1000);
     } catch (error) {
+      display?.getTracks().forEach((track) => track.stop());
       setToast(error instanceof Error ? error.message : "Could not start screen recording");
     }
   }
@@ -566,19 +608,25 @@ function App() {
 
   async function connect(provider: Provider) {
     setCloudError(undefined);
+    setMicrosoftDeviceCode(undefined);
     setConnecting(provider);
     try {
-      const token = await (provider === "SharePoint" ? connectMicrosoft() : connectGoogle());
+      localStorage.setItem(CLOUD_SETTINGS_KEY, JSON.stringify(cloudSettings));
+      const token = await (provider === "SharePoint"
+        ? connectMicrosoft(cloudSettings.microsoftClientId.trim(), cloudSettings.microsoftTenantId.trim(), setMicrosoftDeviceCode)
+        : connectGoogle(cloudSettings.googleClientId.trim(), cloudSettings.googleClientSecret.trim()));
       setTokens((current) => ({ ...current, [provider]: token }));
     } catch (error) {
       setCloudError(error instanceof Error ? error.message : `Could not connect ${provider}.`);
     } finally {
+      setMicrosoftDeviceCode(undefined);
       setConnecting(undefined);
     }
   }
 
   async function publish(recording: Recording, provider: Provider) {
     const token = tokens[provider];
+    const siteUrl = cloudSettings.siteUrl;
     setCloudError(undefined);
     if (!token || (provider === "SharePoint" && !siteUrl.trim())) {
       setSettingsOpen(true);
@@ -591,13 +639,18 @@ function App() {
       const result = provider === "SharePoint"
         ? await uploadSharePoint(token, siteUrl.trim(), recording.title, recording.blob, progress)
         : await uploadGoogle(token, recording.title, recording.blob, progress);
+      const uploadIndex = recording.uploads?.length || 0;
       const updated = { ...recording, uploads: [...(recording.uploads || []), result] };
       setRecordings((items) => items.map((item) => item.id === recording.id ? updated : item));
       try {
         await saveRecording(updated);
         setToast(`Uploaded to ${provider}`);
       } catch {
-        setCloudError(`Uploaded to ${provider}, but the link could not be saved locally. Open it below before reloading.`);
+        setCloudError(`Uploaded to ${provider}, but the file link could not be saved locally. Open it below before reloading.`);
+      }
+      if (provider === "SharePoint") {
+        setUploading({ provider, recordingId: recording.id, percent: 100, sharing: true });
+        await shareUpload(updated, uploadIndex, token);
       }
     } catch (error) {
       if (error instanceof CloudHttpError && error.status === 401) {
@@ -611,15 +664,68 @@ function App() {
     }
   }
 
+  async function shareUpload(recording: Recording, index: number, token: string) {
+    const upload = recording.uploads?.[index];
+    if (!upload) return;
+    if (!upload.driveId || !upload.itemId) {
+      setCloudError("The upload is available, but its item ID was not saved. Open it in SharePoint to create a sharing link.");
+      return;
+    }
+    try {
+      const shareUrl = await createSharePointLink(token, upload.driveId, upload.itemId);
+      const uploads = [...recording.uploads!];
+      uploads[index] = { ...upload, shareUrl };
+      const updated = { ...recording, uploads };
+      setRecordings((items) => items.map((item) => item.id === recording.id ? updated : item));
+      try {
+        await saveRecording(updated);
+        setCloudError(undefined);
+        setToast("SharePoint link ready to copy");
+      } catch {
+        setCloudError("The sharing link was created, but could not be saved locally. Copy it below before reloading.");
+      }
+    } catch (error) {
+      if (error instanceof CloudHttpError && error.status === 401) {
+        setTokens((current) => ({ ...current, SharePoint: undefined }));
+      }
+      setCloudError(`The upload succeeded, but its anyone-with-the-link sharing link could not be created. ${error instanceof Error ? error.message : "Try again or check your SharePoint sharing policy."}`);
+    }
+  }
+
+  async function retryShareLink(recording: Recording, index: number) {
+    const token = tokens.SharePoint;
+    if (!token) {
+      setSettingsOpen(true);
+      setCloudError("Connect SharePoint before creating a sharing link.");
+      return;
+    }
+    setCloudError(undefined);
+    setUploading({ provider: "SharePoint", recordingId: recording.id, percent: 100, sharing: true });
+    try {
+      await shareUpload(recording, index, token);
+    } finally {
+      setUploading(undefined);
+    }
+  }
+
+  async function copyLink(url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      setToast("Link copied");
+    } catch {
+      setCloudError("Could not copy the link. Open it below and copy the address from your browser.");
+    }
+  }
+
   const pipSupported = "documentPictureInPicture" in window;
 
   return (
     <main className="app-shell">
       <header className="topbar">
         <div className="brand">
-          <span className="brand-mark">03</span>
+          <img className="brand-mark" src="/favicon.svg" alt="" />
           <span>Take Three</span>
-          <span className="brand-note">PERSONAL SCREEN STUDIO</span>
+          <span className="brand-note">SCREEN STUDIO</span>
         </div>
         <div className="top-actions">
           <button
@@ -741,15 +847,15 @@ function App() {
                 disabled={trimProgress !== undefined}
                 aria-label="Cover or blur sensitive areas"
                 title="Cover or blur"
-              ><EyeOff /></button>
+              ><EyeOff /><span>Redact</span></button>
               <button
                 className="icon-button"
                 onClick={() => { setTrimOpen((open) => !open); setTrimError(undefined); }}
                 disabled={trimProgress !== undefined}
                 aria-label="Trim beginning and end"
                 title="Trim a copy"
-              ><Scissors /></button>
-              <button className="icon-button" onClick={() => downloadRecording(selected)} aria-label="Download"><Download /></button>
+              ><Scissors /><span>Trim</span></button>
+              <button className="icon-button" onClick={() => downloadRecording(selected)} aria-label="Download"><Download /><span>Download</span></button>
               <button className="icon-button danger" onClick={() => removeRecording(selected)} disabled={!!uploading || transcribingId === selected.id || trimProgress !== undefined} aria-label="Delete"><Trash2 /></button>
             </div>
           </div>
@@ -825,16 +931,26 @@ function App() {
               </label>
               <div className="publish-option">Publish to
                 <div className="publish-row">
-                  {(["SharePoint", "Google Drive"] as Provider[]).map((provider) => (
-                    <button key={provider} disabled={!!uploading} onClick={() => publish(selected, provider)}><Cloud /> {provider}</button>
+                  {(["SharePoint", "Google Drive"] as Provider[]).filter((provider) => provider !== "Google Drive" || tokens[provider]).map((provider) => (
+                    <button key={provider} disabled={!!uploading || transcribingId === selected.id} onClick={() => publish(selected, provider)}><Cloud /> {provider}{provider === "SharePoint" ? " + public link" : ""}</button>
                   ))}
                 </div>
-                <span>Uploads use the destination's existing sharing permissions.</span>
-                {uploading?.recordingId === selected.id && <span role="status">Uploading to {uploading.provider}: {uploading.percent}%</span>}
+                <span>SharePoint uploads create a view link for anyone with the link, if your organization permits it. Google Drive uses existing permissions.</span>
+                {uploading?.recordingId === selected.id && <span role="status">{uploading.sharing ? "Creating SharePoint sharing link..." : `Uploading to ${uploading.provider}: ${uploading.percent}%`}</span>}
                 {selected.uploads?.map((upload, index) => (
-                  <a key={`${upload.url}-${index}`} className="published-link" href={upload.url} target="_blank" rel="noreferrer">
-                    Open {upload.name} in {upload.provider} <ExternalLink />
-                  </a>
+                  <div key={`${upload.url}-${index}`} className="published-upload">
+                    <a className="published-link" href={upload.url} target="_blank" rel="noreferrer">
+                      Open {upload.name} in {upload.provider} <ExternalLink />
+                    </a>
+                    {upload.shareUrl && <a className="published-link" href={upload.shareUrl} target="_blank" rel="noreferrer">Anyone-can-view link <ExternalLink /></a>}
+                    <div className="publish-row">
+                      <button onClick={() => copyLink(upload.shareUrl || upload.url)}><Copy /> Copy {upload.shareUrl ? "sharing" : "file"} link</button>
+                      {upload.provider === "SharePoint" && !upload.shareUrl && upload.driveId && upload.itemId && (
+                        <button disabled={!!uploading || transcribingId === selected.id} onClick={() => retryShareLink(selected, index)}>Create public link</button>
+                      )}
+                    </div>
+                    {upload.provider === "SharePoint" && !upload.shareUrl && (!upload.driveId || !upload.itemId) && <span>For this older upload, open the file in SharePoint to create a sharing link.</span>}
+                  </div>
                 ))}
               </div>
             </div>
@@ -1002,7 +1118,7 @@ function App() {
               <button
                 className="secondary-button transcript-action"
                 onClick={() => transcribeTake(selected)}
-                disabled={!!transcribingId}
+                disabled={!!transcribingId || uploading?.recordingId === selected.id}
               >
                 {transcribingId === selected.id
                   ? <><LoaderCircle className="spinner" /> Working…</>
@@ -1058,7 +1174,8 @@ function App() {
           <section className="settings-modal" role="dialog" aria-modal="true" aria-label="Storage connections" onMouseDown={(event) => event.stopPropagation()}>
             <div className="modal-heading"><div><span className="section-name">Storage</span><h2>Cloud services</h2></div><button className="icon-button" onClick={() => setSettingsOpen(false)} aria-label="Close"><X /></button></div>
             {(["SharePoint", "Google Drive"] as Provider[]).map((provider) => (
-                <div className="provider-row" key={provider}>
+              <div className="provider-settings" key={provider}>
+                <div className="provider-row">
                   <div className="provider-icon">{provider === "SharePoint" ? "S" : "G"}</div>
                   <div><strong>{provider}</strong><span>{tokens[provider] ? "Connected for this session" : "Not connected"}</span></div>
                   {tokens[provider] ? (
@@ -1067,12 +1184,42 @@ function App() {
                     <button className="primary-button" disabled={!!connecting || !!uploading} onClick={() => connect(provider)}>{connecting === provider ? "Connecting..." : "Connect"}</button>
                   )}
                 </div>
+                {provider === "SharePoint" ? (
+                  <div className="settings-fields">
+                    <label className="site-field">Application (client) ID
+                      <input value={cloudSettings.microsoftClientId} disabled={!!connecting || !!uploading} onChange={(event) => { setCloudSettings((current) => ({ ...current, microsoftClientId: event.target.value })); setTokens((current) => ({ ...current, SharePoint: undefined })); }} />
+                    </label>
+                    <label className="site-field">Directory (tenant) ID
+                      <input value={cloudSettings.microsoftTenantId} disabled={!!connecting || !!uploading} onChange={(event) => { setCloudSettings((current) => ({ ...current, microsoftTenantId: event.target.value })); setTokens((current) => ({ ...current, SharePoint: undefined })); }} />
+                    </label>
+                    <label className="site-field">SharePoint site URL
+                      <input type="url" placeholder="https://company.sharepoint.com/sites/team" value={cloudSettings.siteUrl} disabled={!!uploading} onChange={(event) => setCloudSettings((current) => ({ ...current, siteUrl: event.target.value }))} />
+                    </label>
+                    {microsoftDeviceCode && <p className="settings-note device-code" role="status">Enter this code on the Microsoft sign-in page opened in your browser: <strong>{microsoftDeviceCode}</strong>. This is not an Authenticator code. If needed, visit <a href="https://microsoft.com/devicelogin" target="_blank" rel="noreferrer">microsoft.com/devicelogin</a>.</p>}
+                  </div>
+                ) : (
+                  <div className="settings-fields">
+                    <label className="site-field">Google client ID
+                      <input value={cloudSettings.googleClientId} disabled={!!connecting || !!uploading} onChange={(event) => { setCloudSettings((current) => ({ ...current, googleClientId: event.target.value })); setTokens((current) => ({ ...current, "Google Drive": undefined })); }} />
+                    </label>
+                    {window.takeThreeDesktop && <label className="site-field">Desktop client secret
+                      <input type="password" autoComplete="off" value={cloudSettings.googleClientSecret} disabled={!!connecting || !!uploading} onChange={(event) => { setCloudSettings((current) => ({ ...current, googleClientSecret: event.target.value })); setTokens((current) => ({ ...current, "Google Drive": undefined })); }} />
+                    </label>}
+                  </div>
+                )}
+              </div>
             ))}
-            <label className="site-field">SharePoint site URL
-              <input type="url" placeholder="https://company.sharepoint.com/sites/team" value={siteUrl} disabled={!!uploading} onChange={(event) => setSiteUrl(event.target.value)} />
-            </label>
             {cloudError && <p className="cloud-error" role="alert">{cloudError}</p>}
-            <p className="settings-note">Set up OAuth client IDs before connecting. Uploads go to My Drive or the SharePoint site's default document library. Connections last until this page is reloaded.</p>
+            <p className="settings-note">Settings are stored locally on this device, including the Google desktop client secret. Never use a confidential web-app secret. Connections last until the app is reloaded. See the project README for provider setup.</p>
+            <button className="secondary-button save-settings" onClick={() => {
+              try {
+                localStorage.setItem(CLOUD_SETTINGS_KEY, JSON.stringify(cloudSettings));
+                setCloudError(undefined);
+                setToast("Cloud settings saved");
+              } catch (error) {
+                setCloudError(error instanceof Error ? `Could not save cloud settings: ${error.message}` : "Could not save cloud settings.");
+              }
+            }}>Save settings</button>
           </section>
         </div>
       )}
