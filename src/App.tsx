@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  ChevronDown,
   Cloud,
   Download,
   ExternalLink,
@@ -15,6 +14,15 @@ import {
   Upload,
   X,
 } from "lucide-react";
+import {
+  CloudHttpError,
+  connectGoogle,
+  connectMicrosoft,
+  uploadGoogle,
+  uploadSharePoint,
+  type Provider,
+  type UploadResult,
+} from "./cloud";
 
 type Recording = {
   id: string;
@@ -23,12 +31,8 @@ type Recording = {
   duration: number;
   blob: Blob;
   thumbnail?: string;
-  transcript?: string;
-  provider?: "SharePoint" | "Google Drive";
-  publishedUrl?: string;
+  uploads?: UploadResult[];
 };
-
-type Provider = "SharePoint" | "Google Drive";
 
 const DB_NAME = "take-three";
 
@@ -90,10 +94,12 @@ function App() {
   const [draftTitle, setDraftTitle] = useState("");
   const [previewMode, setPreviewMode] = useState<"idle" | "recording" | "review">("idle");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [connectedProviders, setConnectedProviders] = useState<Provider[]>(
-    () => JSON.parse(localStorage.getItem("take-providers") || "[]") as Provider[],
-  );
   const [toast, setToast] = useState<string>();
+  const [tokens, setTokens] = useState<Partial<Record<Provider, string>>>({});
+  const [connecting, setConnecting] = useState<Provider>();
+  const [siteUrl, setSiteUrl] = useState("");
+  const [uploading, setUploading] = useState<{ provider: Provider; recordingId: string; percent: number }>();
+  const [cloudError, setCloudError] = useState<string>();
 
   const streamRef = useRef<MediaStream>(undefined);
   const recorderRef = useRef<MediaRecorder>(undefined);
@@ -316,28 +322,51 @@ function App() {
     setSelectedId(undefined);
   }
 
-  function toggleProvider(provider: Provider) {
-    const updated = connectedProviders.includes(provider)
-      ? connectedProviders.filter((item) => item !== provider)
-      : [...connectedProviders, provider];
-    setConnectedProviders(updated);
-    localStorage.setItem("take-providers", JSON.stringify(updated));
+  async function connect(provider: Provider) {
+    setCloudError(undefined);
+    setConnecting(provider);
+    try {
+      const token = await (provider === "SharePoint" ? connectMicrosoft() : connectGoogle());
+      setTokens((current) => ({ ...current, [provider]: token }));
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : `Could not connect ${provider}.`);
+    } finally {
+      setConnecting(undefined);
+    }
   }
 
   async function publish(recording: Recording, provider: Provider) {
-    if (!connectedProviders.includes(provider)) {
+    const token = tokens[provider];
+    setCloudError(undefined);
+    if (!token || (provider === "SharePoint" && !siteUrl.trim())) {
       setSettingsOpen(true);
-      setToast(`Connect ${provider} first`);
+      setCloudError(!token ? `Connect ${provider} before uploading.` : "Enter your SharePoint site URL before uploading.");
       return;
     }
-    const publishedUrl =
-      provider === "Google Drive"
-        ? `https://drive.google.com/open?id=take-${recording.id}`
-        : `https://sharepoint.com/sites/take-three/videos/${recording.id}`;
-    const updated = { ...recording, provider, publishedUrl };
-    await saveRecording(updated);
-    setRecordings((items) => items.map((item) => item.id === recording.id ? updated : item));
-    setToast(`Ready to publish to ${provider}`);
+    setUploading({ provider, recordingId: recording.id, percent: 0 });
+    const progress = (percent: number) => setUploading({ provider, recordingId: recording.id, percent });
+    try {
+      const result = provider === "SharePoint"
+        ? await uploadSharePoint(token, siteUrl.trim(), recording.title, recording.blob, progress)
+        : await uploadGoogle(token, recording.title, recording.blob, progress);
+      const updated = { ...recording, uploads: [...(recording.uploads || []), result] };
+      setRecordings((items) => items.map((item) => item.id === recording.id ? updated : item));
+      try {
+        await saveRecording(updated);
+        setToast(`Uploaded to ${provider}`);
+      } catch {
+        setCloudError(`Uploaded to ${provider}, but the link could not be saved locally. Open it below before reloading.`);
+      }
+    } catch (error) {
+      if (error instanceof CloudHttpError && error.status === 401) {
+        setTokens((current) => ({ ...current, [provider]: undefined }));
+      }
+      setCloudError(error instanceof TypeError
+        ? `The connection to ${provider} was interrupted. Check the destination for a completed upload before retrying.`
+        : error instanceof Error ? error.message : `${provider} upload failed. Check the destination before retrying.`);
+    } finally {
+      setUploading(undefined);
+    }
   }
 
   const pipSupported = "documentPictureInPicture" in window;
@@ -348,7 +377,6 @@ function App() {
         <div className="brand"><span className="brand-mark"><Play fill="currentColor" /></span><span>Take Three</span></div>
         <div className="top-actions">
           <button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Settings"><Settings /></button>
-          <button className="avatar" aria-label="Account">DS</button>
         </div>
       </header>
 
@@ -444,7 +472,7 @@ function App() {
             <div><span className="section-name">Selected take</span><h2>{selected.title}</h2></div>
             <div className="detail-actions">
               <button className="icon-button" onClick={() => downloadRecording(selected)} aria-label="Download"><Download /></button>
-              <button className="icon-button danger" onClick={() => removeRecording(selected)} aria-label="Delete"><Trash2 /></button>
+              <button className="icon-button danger" onClick={() => removeRecording(selected)} disabled={!!uploading} aria-label="Delete"><Trash2 /></button>
             </div>
           </div>
           <div className="detail-grid">
@@ -461,41 +489,50 @@ function App() {
                 <div className="thumbnail-upload">
                   <Upload />
                   <span>{selected.thumbnail ? "Replace image" : "Upload image"}</span>
-                  <input type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => event.target.files?.[0] && uploadThumbnail(event.target.files[0])} />
+                  <input type="file" accept="image/jpeg,image/png,image/webp" disabled={!!uploading} onChange={(event) => event.target.files?.[0] && uploadThumbnail(event.target.files[0])} />
                 </div>
               </label>
-              <label>Publish to
+              <div className="publish-option">Publish to
                 <div className="publish-row">
                   {(["SharePoint", "Google Drive"] as Provider[]).map((provider) => (
-                    <button key={provider} onClick={() => publish(selected, provider)} className={selected.provider === provider ? "active" : ""}>
-                      <Cloud /> {provider}
-                    </button>
+                    <button key={provider} disabled={!!uploading} onClick={() => publish(selected, provider)}><Cloud /> {provider}</button>
                   ))}
                 </div>
-              </label>
-              {selected.publishedUrl && (
-                <a className="published-link" href={selected.publishedUrl} target="_blank" rel="noreferrer">Open in {selected.provider} <ExternalLink /></a>
-              )}
+                <span>Uploads use the destination's existing sharing permissions.</span>
+                {uploading?.recordingId === selected.id && <span role="status">Uploading to {uploading.provider}: {uploading.percent}%</span>}
+                {selected.uploads?.map((upload, index) => (
+                  <a key={`${upload.url}-${index}`} className="published-link" href={upload.url} target="_blank" rel="noreferrer">
+                    Open {upload.name} in {upload.provider} <ExternalLink />
+                  </a>
+                ))}
+              </div>
             </div>
           </div>
         </section>
       )}
 
+      {cloudError && !settingsOpen && <div className="cloud-alert" role="alert">{cloudError}<button onClick={() => setCloudError(undefined)} aria-label="Dismiss error"><X /></button></div>}
+
       {settingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setSettingsOpen(false)}>
           <section className="settings-modal" role="dialog" aria-modal="true" aria-label="Storage connections" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="modal-heading"><div><span className="section-name">Storage</span><h2>Connected services</h2></div><button className="icon-button" onClick={() => setSettingsOpen(false)} aria-label="Close"><X /></button></div>
-            {(["SharePoint", "Google Drive"] as Provider[]).map((provider) => {
-              const connected = connectedProviders.includes(provider);
-              return (
+            <div className="modal-heading"><div><span className="section-name">Storage</span><h2>Cloud services</h2></div><button className="icon-button" onClick={() => setSettingsOpen(false)} aria-label="Close"><X /></button></div>
+            {(["SharePoint", "Google Drive"] as Provider[]).map((provider) => (
                 <div className="provider-row" key={provider}>
                   <div className="provider-icon">{provider === "SharePoint" ? "S" : "G"}</div>
-                  <div><strong>{provider}</strong><span>{connected ? "Connected" : "Not connected"}</span></div>
-                  <button className={connected ? "secondary-button" : "primary-button"} onClick={() => toggleProvider(provider)}>{connected ? "Disconnect" : "Connect"}</button>
+                  <div><strong>{provider}</strong><span>{tokens[provider] ? "Connected for this session" : "Not connected"}</span></div>
+                  {tokens[provider] ? (
+                    <button className="secondary-button" disabled={!!uploading} onClick={() => setTokens((current) => ({ ...current, [provider]: undefined }))}>Disconnect</button>
+                  ) : (
+                    <button className="primary-button" disabled={!!connecting || !!uploading} onClick={() => connect(provider)}>{connecting === provider ? "Connecting..." : "Connect"}</button>
+                  )}
                 </div>
-              );
-            })}
-            <p className="settings-note">Connections are stored locally for this prototype. Production OAuth credentials and resumable uploads should be provided through environment configuration.</p>
+            ))}
+            <label className="site-field">SharePoint site URL
+              <input type="url" placeholder="https://company.sharepoint.com/sites/team" value={siteUrl} disabled={!!uploading} onChange={(event) => setSiteUrl(event.target.value)} />
+            </label>
+            {cloudError && <p className="cloud-error" role="alert">{cloudError}</p>}
+            <p className="settings-note">Set up OAuth client IDs before connecting. Uploads go to My Drive or the SharePoint site's default document library. Connections last until this page is reloaded.</p>
           </section>
         </div>
       )}

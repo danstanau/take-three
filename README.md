@@ -1,41 +1,101 @@
 # Take Three
 
-Take Three is a browser-based screen recording app for recording, reviewing, saving, and publishing short videos to SharePoint or Google Drive.
+Take Three is an early, local-first browser screen recorder that can upload
+recordings to SharePoint or Google Drive.
+
+**Prototype:** Video editing, transcription, and MP4 export are not implemented.
+Cloud uploads require your own OAuth app registrations and provider access.
+
+## What works today
+
+- Record a screen or window with an optional microphone and a three-second countdown.
+- Review a take and save it to a local browser library.
+- Download recordings as WebM, delete them, or upload a custom thumbnail.
+- Use floating recording controls in browsers that support Document Picture-in-Picture.
+- Upload saved WebM recordings to Google Drive or a SharePoint document library.
+
+Recordings and thumbnails are stored in the browser's IndexedDB, not in an
+account or cloud backup. Clearing browser data, using private browsing, or
+running out of storage can remove or prevent saving recordings. Download
+anything you want to keep. Screen and audio capture support varies by browser,
+operating system, and the source selected. A floating control window may
+appear when capturing the entire display.
 
 ## Run locally
 
+Use Node.js 24 and npm. The app requires a secure context for screen capture;
+`localhost` is supported.
+
 ```bash
-npm install
+git clone https://github.com/danstanau/take-three.git
+cd take-three
+npm ci
 npm run dev
 ```
 
-Open the local URL shown by Vite. Screen recording requires a supported Chromium, Edge, or Firefox browser and a secure context (`localhost` is treated as secure).
+Open the local URL printed by Vite. Run `npm run build` to type-check and create
+a production build, then `npm run preview` to serve that build locally.
 
-## Features
+## Set up cloud uploads
 
-- Screen capture with optional microphone audio
-- Three-second countdown with an audible cue
-- Recording timer and floating Picture-in-Picture controls in supported browsers
-- Local IndexedDB recording library
-- First-frame thumbnail generation and custom thumbnail uploads
-- Download and delete actions
-- SharePoint and Google Drive connection controls
-- Publish-ready metadata for future OAuth uploads
+Copy `.env.example` to `.env.local` and fill in the public client IDs for the
+providers you want to use. Restart the Vite server after changing them. Do not
+put client secrets in Vite environment variables: they are embedded in the
+client application.
 
-## Storage integration status
+### SharePoint
 
-This prototype persists videos and thumbnails in the browser. SharePoint and Google Drive are represented through a provider abstraction and connection settings; live OAuth and resumable uploads require tenant-specific credentials and a backend:
+1. In Microsoft Entra, register a single-page application for your work or
+   school tenant. Add `http://localhost:5173` as a **Single-page application**
+   redirect URI, or use the exact origin where you host Take Three.
+2. Under Microsoft Graph delegated permissions, add `Sites.ReadWrite.All` and
+   obtain any required administrator consent. This permission allows access to
+   sites the signed-in user can access; it does not bypass their permissions.
+3. Set `VITE_MICROSOFT_CLIENT_ID` to the application (client) ID and
+   `VITE_MICROSOFT_TENANT_ID` to the directory (tenant) ID.
+4. Open settings, connect SharePoint, and enter a site URL such as
+   `https://company.sharepoint.com/sites/team`. Uploads go to the root of that
+   site's **default** document library. The account needs write permission there.
 
-- Microsoft Graph upload sessions for SharePoint
-- Google OAuth 2.0 and Drive API multipart/resumable uploads
+### Google Drive
 
-## Rust migration
+1. In Google Cloud, enable the Google Drive API and configure the OAuth consent
+   screen. Add your account as a test user if the app is in testing mode.
+2. Create a **Web application** OAuth client and add `http://localhost:5173`
+   to its authorized JavaScript origins, or use your hosted app's exact origin.
+3. Set `VITE_GOOGLE_CLIENT_ID` to that client ID. In settings, connect Google
+   Drive. Uploads go to the root of the signed-in user's My Drive.
 
-The recommended migration sequence is to keep the React/TypeScript frontend and move server-side services to Rust after the browser product stabilizes:
+The app requests Google's `drive.file` scope, which grants access to files
+created or opened by the app rather than the whole Drive. Google may require
+OAuth app verification before external users can use an app in production.
+The page loads Google's Identity Services script for sign-in. Provider tokens
+are kept in memory for the current page session; disconnecting or reloading
+removes the app's active connection. Disconnecting does not revoke prior
+consent in the provider's account settings.
 
-1. Rust API (`axum`) for authentication and recording metadata
-2. PostgreSQL or SQLite for metadata
-3. Object storage for source and rendered videos
-4. FFmpeg worker for MP4 conversion and trimming
-5. Provider adapters for Microsoft Graph and Google Drive
-6. Optional Tauri desktop shell for native macOS capture and Picture-in-Picture
+Select a saved recording and choose a provider under **Publish to**. Uploads
+are sent directly from the browser in chunks, and the resulting link is saved
+with the local recording. No sharing link or public permission is created:
+the destination's existing access rules apply. If the browser closes or a
+network error interrupts an upload, the app cannot resume it; check the
+destination for an existing file before retrying. Repeated uploads create
+separate files.
+
+## Roadmap
+
+Editing, transcription, and more reliable audio and browser support are future
+work.
+
+For a Rust experiment, keep the React interface and first build a small Rust
+service using Axum for provider integrations. A later FFmpeg worker could handle
+rendering and trimming, while Tauri is an option if a native desktop shell
+becomes useful. Neither is required to run the current app.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE).
