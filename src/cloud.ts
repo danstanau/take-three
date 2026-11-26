@@ -1,7 +1,14 @@
 import { BrowserCacheLocation, PublicClientApplication } from "@azure/msal-browser";
 
 export type Provider = "SharePoint" | "Google Drive";
-export type UploadResult = { provider: Provider; url: string; name: string };
+export type UploadResult = {
+  provider: Provider;
+  url: string;
+  name: string;
+  driveId?: string;
+  itemId?: string;
+  shareUrl?: string;
+};
 export type UploadProgress = (percent: number) => void;
 
 const GOOGLE_SCOPE = "https://www.googleapis.com/auth/drive.file";
@@ -34,41 +41,40 @@ declare global {
   }
 }
 
-let microsoftClient: PublicClientApplication | undefined;
-
 export class CloudHttpError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
   }
 }
 
-export async function connectMicrosoft(): Promise<string> {
-  const clientId = import.meta.env.VITE_MICROSOFT_CLIENT_ID;
-  const tenantId = import.meta.env.VITE_MICROSOFT_TENANT_ID;
+export async function connectMicrosoft(clientId: string, tenantId: string, onDeviceCode?: (code: string) => void): Promise<string> {
   if (!clientId || !tenantId) {
-    throw new Error("Set VITE_MICROSOFT_CLIENT_ID and VITE_MICROSOFT_TENANT_ID, then restart the app.");
+    throw new Error("Enter your Microsoft application and tenant IDs in Settings.");
   }
-  if (!microsoftClient) {
-    const client = new PublicClientApplication({
-      auth: {
-        clientId,
-        authority: `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}`,
-        redirectUri: window.location.origin,
-      },
-      cache: { cacheLocation: BrowserCacheLocation.MemoryStorage },
-    });
-    await client.initialize();
-    microsoftClient = client;
+  if (window.takeThreeDesktop) {
+    return window.takeThreeDesktop.connect({ provider: "SharePoint", clientId, tenantId }, onDeviceCode);
   }
-  const result = await microsoftClient.loginPopup({ scopes: [GRAPH_SCOPE] });
+  const client = new PublicClientApplication({
+    auth: {
+      clientId,
+      authority: `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}`,
+      redirectUri: window.location.origin,
+    },
+    cache: { cacheLocation: BrowserCacheLocation.MemoryStorage },
+  });
+  await client.initialize();
+  const result = await client.loginPopup({ scopes: [GRAPH_SCOPE] });
   if (!result.accessToken) throw new Error("Microsoft did not return an access token.");
   return result.accessToken;
 }
 
-export function connectGoogle(): Promise<string> {
-  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+export function connectGoogle(clientId: string, clientSecret: string): Promise<string> {
   if (!clientId) {
-    return Promise.reject(new Error("Set VITE_GOOGLE_CLIENT_ID, then restart the app."));
+    return Promise.reject(new Error("Enter your Google client ID in Settings."));
+  }
+  if (window.takeThreeDesktop) {
+    if (!clientSecret) return Promise.reject(new Error("Enter your Google desktop client secret in Settings."));
+    return window.takeThreeDesktop.connect({ provider: "Google Drive", clientId, clientSecret });
   }
   if (!window.google?.accounts.oauth2) {
     return Promise.reject(new Error("Google sign-in is unavailable. Check your connection and reload the page."));
@@ -188,12 +194,35 @@ export async function uploadSharePoint(
       continue;
     }
     await checkResponse(response, "SharePoint upload");
-    const item: { webUrl?: string; name?: string } = await response.json();
+    const item: { id?: string; webUrl?: string; name?: string } = await response.json();
     if (end !== blob.size) throw new Error("SharePoint ended the upload unexpectedly.");
     progress(100);
-    return { provider: "SharePoint", url: secureUrl(item.webUrl, "SharePoint file URL"), name: item.name || name };
+    return {
+      provider: "SharePoint",
+      url: secureUrl(item.webUrl, "SharePoint file URL"),
+      name: item.name || name,
+      driveId: drive.id,
+      itemId: item.id,
+    };
   }
   throw new Error("SharePoint did not confirm the completed upload.");
+}
+
+export async function createSharePointLink(token: string, driveId: string, itemId: string): Promise<string> {
+  const response = await fetch(
+    `${GRAPH}/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(itemId)}/createLink`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "view", scope: "anonymous", retainInheritedPermissions: true }),
+    },
+  );
+  await checkResponse(response, "Creating the SharePoint sharing link");
+  const permission: { link?: { webUrl?: string; scope?: string; type?: string } } = await response.json();
+  if (permission.link?.scope !== "anonymous" || permission.link.type !== "view") {
+    throw new Error("SharePoint did not confirm an anyone-with-the-link view permission.");
+  }
+  return secureUrl(permission.link.webUrl, "SharePoint sharing link");
 }
 
 export async function uploadGoogle(

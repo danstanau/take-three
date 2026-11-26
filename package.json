@@ -4,11 +4,12 @@
   "description": "A local-first browser screen recorder with SharePoint and Google Drive uploads",
   "private": true,
   "type": "module",
-  "main": "index.js",
+  "main": "desktop/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "test": "vitest run",
+    "build:mac": "npm run build && electron-builder --mac dmg",
+    "test": "vitest run && node --test desktop/*.check.cjs",
     "preview": "vite preview"
   },
   "repository": {
@@ -22,20 +23,66 @@
     "url": "https://github.com/danstanau/take-three/issues"
   },
   "homepage": "https://github.com/danstanau/take-three#readme",
-  "dependencies": {
+  "devDependencies": {
     "@azure/msal-browser": "^5.30.0",
     "@huggingface/transformers": "^4.3.2",
-    "fflate": "^0.8.3",
-    "lucide-react": "^1.80.0",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1"
-  },
-  "devDependencies": {
     "@types/react": "^19.3.3",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
+    "electron": "^45.5.0",
+    "electron-builder": "^26.18.0",
+    "fflate": "^0.8.3",
+    "lucide-react": "^1.80.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.8",
     "vitest": "^5.1.2"
+  },
+  "build": {
+    "appId": "com.danstanau.takethree",
+    "productName": "Take Three",
+    "directories": {
+      "app": "desktop",
+      "output": "release"
+    },
+    "files": [
+      "main.cjs",
+      "oauth.cjs",
+      "preload.cjs",
+      "screen-capture.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist",
+        "to": "dist"
+      }
+    ],
+    "mac": {
+      "icon": "desktop/icon.icns",
+      "category": "public.app-category.video",
+      "target": [
+        "dmg"
+      ],
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Take Three uses your microphone to record narration with your screen."
+      }
+    },
+    "dmg": {
+      "icon": "desktop/icon.icns",
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    }
   }
 }
