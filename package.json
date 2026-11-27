@@ -9,6 +9,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "build:mac": "npm run build && electron-builder --mac dmg",
+    "build:win": "npm run build && electron-builder --win nsis --x64",
     "test": "vitest run && node --test desktop/*.check.cjs",
     "preview": "vite preview"
   },
@@ -68,6 +69,20 @@
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Take Three uses your microphone to record narration with your screen."
       }
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
     },
     "dmg": {
       "icon": "desktop/icon.icns",

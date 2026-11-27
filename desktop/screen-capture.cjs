@@ -1,4 +1,4 @@
-function createDisplayMediaHandler({ desktopCapturer, dialog, isAppUrl }) {
+function createDisplayMediaHandler({ desktopCapturer, dialog, isAppUrl, platform = process.platform }) {
   return async (request, callback) => {
     if (!isAppUrl(request.securityOrigin) || !request.frame || !request.videoRequested) {
       callback(null);
@@ -15,7 +15,9 @@ function createDisplayMediaHandler({ desktopCapturer, dialog, isAppUrl }) {
         await dialog.showMessageBox({
           type: "warning",
           message: "No screens or windows are available to record.",
-          detail: "Check Screen Recording access for Take Three in macOS Privacy & Security settings.",
+          detail: platform === "win32"
+            ? "Check that Windows screen capture and your graphics drivers are available, then try again."
+            : "Check Screen Recording access for Take Three in macOS Privacy & Security settings.",
         });
       } else {
         const { response } = await dialog.showMessageBox({

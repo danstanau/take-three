@@ -40,3 +40,20 @@ test("rejects a cancelled selection", async () => {
   await handler(request, (value) => { result = value; });
   assert.equal(result, null);
 });
+
+test("uses Windows-specific guidance when no capture source is available", async () => {
+  let detail;
+  const handler = createDisplayMediaHandler({
+    platform: "win32",
+    isAppUrl,
+    desktopCapturer: { getSources: async () => [] },
+    dialog: {
+      showMessageBox: async (options) => {
+        detail = options.detail;
+        return { response: 0 };
+      },
+    },
+  });
+  await handler(request, () => {});
+  assert.match(detail, /Windows screen capture/);
+});

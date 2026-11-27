@@ -70,6 +70,28 @@ On macOS 15
 and later, macOS provides the screen and window picker; older releases use a
 basic source picker. System audio availability varies by macOS version.
 
+## Build the Windows app
+
+On a Windows machine with Node.js 24 and npm, run `npm run build:win`. This
+creates a 64-bit NSIS installer in `release/`, with separate per-user
+installation and start-menu shortcuts. The app is unsigned. Windows SmartScreen
+or antivirus software may show an unknown-publisher warning; verify the source
+and explicitly allow or install it for testing.
+
+For screen capture, use Windows 10 or later and allow the app to show the
+Windows screen/window picker. Windows privacy settings must allow screen
+capture for desktop apps. Microphone access must be allowed for the app and
+for Windows privacy settings. System-audio capture depends on the Windows
+version and selected source; system audio may not be available even when
+microphone capture works. Browser Picture-in-Picture support can differ by
+Windows browser and is not the same as the desktop window picker.
+
+The Windows build uses the same local `http://localhost:5173` app server,
+IndexedDB library, and cloud-provider configuration as the macOS app. Local
+recordings and settings are stored in the Windows app profile, not in a
+cloud account. OAuth desktop settings must be created for the Windows app
+or desktop client type; do not reuse a browser OAuth origin.
+
 ## Set up cloud uploads
 
 Enter provider details in **Settings → Cloud services** at runtime, then choose
